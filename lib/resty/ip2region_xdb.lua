@@ -2,7 +2,7 @@
 --- ip2region v2's LuaJIT FFI based implementation
 ---
 --- @author Appla<bhg@live.it>.
---- @version 0.1.1
+--- @version 0.2.0
 --- @license Apache License Version 2.0
 ---
 
@@ -58,14 +58,14 @@ typedef struct {
     unsigned int created_at;
     unsigned int start_index_ptr;
     unsigned int end_index_ptr;
-    char buffer[240];
+    unsigned char buffer[240];
     xdb_1st_idx_entity_t indexes[65536];
 } xdb_header_t;
 
 typedef struct {
     unsigned int length;
     xdb_header_t *header;
-    const char *data;
+    const unsigned char *data;
 } xdb_entity_t;
 
 typedef struct __attribute((packed, aligned(2))) {
@@ -94,10 +94,13 @@ uint32_t ntohl(uint32_t netlong);
 
 -- holding the file content
 local XDB_FILE_REGISTRY = new_tab(0, 4)
+
+-- the official xdb data format is like: country/region|flags|province|city|isp
 -- 中国|0|上海|上海市|电信
 local IP_INFO_FIELD_INDEXES = {
     country = 1,
     region = 2,
+    flags = 2,
     province = 3,
     city = 4,
     isp = 5,
@@ -107,17 +110,18 @@ local IP_INFO_FIELD_INDEXES = {
 local C = ffi.C
 
 -- ctypes
-local const_char_ptr_ct = ffi_typeof("const char *")
+local const_char_ptr_ct = ffi_typeof("const unsigned char *")
 local xdb_2nd_idx_entity_data_ptr_ct = ffi_typeof('xdb_2nd_idx_entity_data_t *')
 local xdb_2nd_idx_entity_ip_ptr_ct = ffi_typeof('xdb_2nd_idx_entity_ip_t *')
 
 local _M = {
-    _VERSION = '0.1.1',
+    _VERSION = '0.2.0',
     IP_INFO_FIELD_INDEXES = IP_INFO_FIELD_INDEXES,
 
     --constants
     IDX_COUNTRY = 1,
     IDX_REGION = 2,
+    IDX_FLAGS = 2,
     IDX_PROVINCE = 3,
     IDX_CITY = 4,
     IDX_ISP = 5,
@@ -157,21 +161,32 @@ do
     end
 end
 
--- this should be called in sep-thread or blocking-tolerance contexts
+-- This should be called in sep-thread or blocking-tolerance contexts
 ---@param filename string
 ---@return string
 local function load_file(filename)
-    if ngx then
-        local phase = ngx.get_phase()
-        if phase ~= "init" and phase ~= "init_worker" then
-            error("load_file should be called in init phase or init_worker phase")
-        end
-    end
-    -- @todo using ngx.run_worker_thread to load?
     local f = assert(io_open(filename, "rb"))
     local content = f:read("*all")
     f:close()
     return content
+end
+
+do
+    -- openresty specific
+    if ngx then
+        -- @TODO using ngx.run_worker_thread to load?
+        local get_phase = ngx.get_phase
+        function load_file(filename)
+            local phase = get_phase()
+            if phase ~= "init" and phase ~= "init_worker" then
+                error("load_file should be called in init phase or init_worker phase")
+            end
+            local f = assert(io_open(filename, "rb"))
+            local content = f:read("*all")
+            f:close()
+            return content
+        end
+    end
 end
 
 ---@param content string
@@ -192,7 +207,7 @@ local function new_xdb_searcher_from_file(filename)
     return new_xdb_searcher(content), content
 end
 
--- split by str separator(this usually more faster than ffi version, but alloc more strings)
+-- Split by str separator(this usually more faster than ffi version, but alloc more strings)
 ---@param str string
 ---@param separator string
 ---@param dst_tab table
@@ -220,27 +235,28 @@ end
 -- search IP(long int little endian) in xdb
 --- @param xdb_searcher table xdb_searcher_t cdata
 --- @param ip number ip in long int little endian
---- @param ret_ptr boolean
---- @return table|string|nil, string|nil
+--- @return cdata|nil, string|number
 --- @todo using be ip to eliminate shifting?
-local function search_binary_ip(xdb_searcher, ip, ret_ptr)
+local function search_binary_ip(xdb_searcher, ip)
     if ip == 0 then return nil, "invalid ip"; end
-    local ptr = xdb_searcher.header.indexes[band(rshift(ip, 24), 0xFF) * XDB_IDX_COLS + band(rshift(ip, 16), 0xFF)]
-    local start_idx = ptr.sp.u32
     local l = 0
-    local h = (ptr.ep.u32 - start_idx) / XDB_SEGMENT_IDX_SIZE;
+    local start_idx, h
+    do
+        local col, row = band(rshift(ip, 24), 0xFF), band(rshift(ip, 16), 0xFF)
+        local ptr = xdb_searcher.header.indexes[col * XDB_IDX_COLS + row]
+        start_idx = ptr.sp.u32
+        h = (ptr.ep.u32 - start_idx) / XDB_SEGMENT_IDX_SIZE;
+    end
     local data_ptr
     local data_len = 0
     while l <= h do
         local m = rshift(l + h, 1)
         local m_ptr = xdb_searcher.data + start_idx + (m * XDB_SEGMENT_IDX_SIZE)
         local idx_elt = ffi_cast(xdb_2nd_idx_entity_ip_ptr_ct, m_ptr)
-        local seg_start_ip = idx_elt.start_ip.u32
-        if ip < seg_start_ip then
+        if ip < idx_elt.start_ip.u32 then
             h = m - 1
         else
-            local seg_end_ip = idx_elt.end_ip.u32
-            if ip > seg_end_ip then
+            if ip > idx_elt.end_ip.u32 then
                 l = m + 1
             else
                 local data_elt = ffi_cast(xdb_2nd_idx_entity_data_ptr_ct, m_ptr + XDB_SEGMENT_IDX_IP_SIZE)
@@ -254,26 +270,27 @@ local function search_binary_ip(xdb_searcher, ip, ret_ptr)
     if data_len == 0 then
         return nil, "not found"
     end
-    if ret_ptr == true then
-        return xdb_searcher.data + data_ptr, data_len
-    end
-    return ffi_string(xdb_searcher.data + data_ptr, data_len), data_len
+    return xdb_searcher.data + data_ptr, data_len
 end
 
 do
-    -- @FIXME test needed for big-endian
+    -- @FIXME test needed for big-endian version
     -- big-endian version
     if ffi.abi("be") then
         local function la_u32_to_big_endian(la_u32_elt)
             return la_u32_elt.b0 + lshift(la_u32_elt.b1, 8) + lshift(la_u32_elt.b2, 16) + lshift(la_u32_elt.b3, 24)
         end
 
-        search_binary_ip = function(xdb_searcher, ip, ret_ptr)
+        search_binary_ip = function(xdb_searcher, ip)
             if ip == 0 then return nil, "invalid ip"; end
-            local ptr = xdb_searcher.header.indexes[band(rshift(ip, 24), 0xFF) * XDB_IDX_COLS + band(rshift(ip, 16), 0xFF)]
-            local start_idx = la_u32_to_big_endian(ptr.sp)
             local l = 0
-            local h = (la_u32_to_big_endian(ptr.ep) - start_idx) / XDB_SEGMENT_IDX_SIZE;
+            local start_idx, h
+            do
+                local col, row = band(rshift(ip, 24), 0xFF), band(rshift(ip, 16), 0xFF)
+                local ptr = xdb_searcher.header.indexes[col * XDB_IDX_COLS + row]
+                start_idx = la_u32_to_big_endian(ptr.sp)
+                h = (la_u32_to_big_endian(ptr.ep) - start_idx) / XDB_SEGMENT_IDX_SIZE;
+            end
             local data_ptr
             local data_len = 0
             while l <= h do
@@ -299,24 +316,20 @@ do
             if data_len == 0 then
                 return nil, "not found"
             end
-            if ret_ptr == true then
-                return xdb_searcher.data + data_ptr, data_len
-            end
-            return ffi_string(xdb_searcher.data + data_ptr, data_len)
+            return xdb_searcher.data + data_ptr, data_len
         end
     end
 end
 
--- search an IP address
+-- Search an IP address
 ---@param xdb_searcher table
 ---@param ip_str string
----@param ret_ptr boolean|nil
----@return string|table|nil, string|nil
-local function search_ip(xdb_searcher, ip_str, ret_ptr)
-    return search_binary_ip(xdb_searcher, ipv4_to_long(ip_str), ret_ptr)
+---@return cdata|nil, string|number
+local function search_ip(xdb_searcher, ip_str)
+    return search_binary_ip(xdb_searcher, ipv4_to_long(ip_str))
 end
 
--- search meta info contains any of needles
+-- Search meta info contains any of needles
 ---@param xdb_searcher table
 ---@param ip string
 ---@param arg_t string
@@ -324,7 +337,7 @@ end
 ---@param ... string
 ---@return boolean, string|nil
 local function bin_ip_info_contains_internal(xdb_searcher, ip, arg_t, nds, ...)
-    local ptr, len = search_binary_ip(xdb_searcher, ip, true)
+    local ptr, len = search_binary_ip(xdb_searcher, ip)
     if not ptr then
         return nil, "not found"
     end
@@ -359,7 +372,7 @@ local function bin_ip_info_contains_internal(xdb_searcher, ip, arg_t, nds, ...)
     return false, "no one matched"
 end
 
--- check if binary IP 's region info contains any of needles
+-- Check if binary IP 's region info contains any of needles for official xdb data.
 ---@param self table
 ---@param ip string
 ---@param nds string|table if table is provided all the rest needles will be ignored.
@@ -381,7 +394,7 @@ function _M.binary_ip_info_contains(self, ip, nds, ...)
     return bin_ip_info_contains_internal(self.xdb_searcher, ip, arg_t, nds, ...)
 end
 
--- check if IP 's region info contains any of needles
+-- Check if IP 's region info contains any of needles for official xdb data.
 ---@param self table
 ---@param ip_str number
 ---@param nds string|table if table is provided all the rest needles will be ignored.
@@ -420,7 +433,8 @@ local function format_response(s, ct, dst_tab)
         return dst_tab
     elseif ct == true then
         local tab = str_split(s, '|', shared_res_tab)
-        return tab[1], tab[2], tab[3], tab[4], tab[5]
+        -- 1:IDX_COUNTRY, 3:IDX_PROVINCE, 4:IDX_CITY, 5:IDX_ISP, 2:IDX_REGION
+        return tab[1], tab[3], tab[4], tab[5], tab[2]
     elseif type(ct) == 'number' and ct < 6 then
         -- @TODO create sub-str only if needed?
         shared_res_tab[ct] = nil
@@ -431,7 +445,7 @@ local function format_response(s, ct, dst_tab)
     end
 end
 
--- search IP info
+-- Search IP info for official xdb data.
 ---@param self table
 ---@param ip string
 ---@param ct number|boolean|nil { nil: table, true: var-args, number: single field, false: raw string }.
@@ -441,17 +455,17 @@ local function lookup(self, ip, ct, dst_tab)
     if type(ip) ~= "string" then
         return nil, "ip must be a string"
     end
-    local res, err = search_ip(self.xdb_searcher, ip, dst_tab)
-    if res then
-        return format_response(res, ct, dst_tab)
+    local s, len_or_err = search_ip(self.xdb_searcher, ip, dst_tab)
+    if s then
+        return format_response(ffi_string(s, len_or_err), ct, dst_tab)
     end
 
-    return res, err
+    return s, len_or_err
 end
 
 _M.lookup = lookup
 
--- Get the city name of an IP address
+-- Get the city name of an IP address for official xdb data.
 ---@param ip string
 ---@return table,number|nil, string
 function _M:lookup_city(ip)
@@ -461,7 +475,7 @@ end
 -- Alias for lookup
 _M.search_ip = lookup
 
--- Get IP info
+-- Get IP info for official xdb data.
 ---@param self table
 ---@param ip number|string binary/uint32 ip address.
 ---@param ct number|boolean|nil { nil: table, true: var-args, number: single field, false: raw string }.
@@ -474,11 +488,70 @@ function _M.search_binary_ip(self, ip, ct, dst_tab)
             return nil, "ip must be a number"
         end
     end
-    local s, err = search_binary_ip(self.xdb_searcher, ip)
+    local s, len_or_err = search_binary_ip(self.xdb_searcher, ip)
     if s then
-        return format_response(s, ct, dst_tab)
+        return format_response(ffi_string(s, len_or_err), ct, dst_tab)
     end
-    return s, err
+    return s, len_or_err
+end
+
+-- Set custom parser
+---@param self table
+---@param parser_fn function Result Parser function(res_ptr/nil, len/error): any.
+---@return table
+function _M.set_parser(self, parser_fn)
+    if type(parser_fn) ~= "function" then
+        return nil, "func must be a function"
+    end
+    self.parser_fn = parser_fn
+    return self
+end
+
+-- Get IP info with custom parser for binary ip.
+---@param self table
+---@param ip number|string binary/uint32 ip address.
+---@param parser_fn function Result Parser function.
+---@return string|table|nil, string|nil
+function _M.lookup_and_parse_binary(self, ip, parser_fn)
+    if type(ip) ~= "number" then
+        ip = parse_bin_ipv4(ip)
+        if not ip then return nil, "ip must be a number or byte[4]"; end
+    end
+    if type(parser_fn) ~= "function" then
+        parser_fn = self.parser_fn;
+    end
+    return parser_fn(search_binary_ip(self.xdb_searcher, ip))
+end
+
+-- Get IP info with custom parser
+---@param self table
+---@param ip string dot-decimal ip address.
+---@param parser_fn function Result Parser function.
+---@return string|table|nil, string|nil
+function _M.lookup_and_parse(self, ip, parser_fn)
+    if type(ip) ~= "string" then
+        return nil, "ip must be a string"
+    end
+    if type(parser_fn) ~= "function" then
+        parser_fn = self.parser_fn;
+    end
+    return parser_fn(search_binary_ip(self.xdb_searcher, ipv4_to_long(ip)))
+end
+
+-- Forward the result as string
+---@param ptr cdata
+---@param len number
+---@return string, number
+local function forward_str(ptr, len)
+    return ffi_string(ptr, len), len
+end
+
+-- Forward the result as pointer
+---@param ptr cdata
+---@param len number
+---@return cdata, number
+local function forward_ptr(ptr, len)
+    return ptr, len
 end
 
 -- create a new ip2region object
@@ -490,6 +563,7 @@ local function new(opts)
     end
     local self = {
         _raw_contents_ = nil,
+        parser_fn = type(opts.parser_fn) == "function" and opts.parser_fn or forward_str,
     }
     if XDB_FILE_REGISTRY[opts.db_path] then
         self._raw_contents_ = XDB_FILE_REGISTRY[opts.db_path]
